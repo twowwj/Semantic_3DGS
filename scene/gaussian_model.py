@@ -27,6 +27,8 @@ try:
 except:
     pass
 
+RASTERIZER_SEMANTIC_DIM = 8
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -47,14 +49,21 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree, optimizer_type="default"):
+    def __init__(self, sh_degree, optimizer_type="default", semantic_dim=8):
+        if semantic_dim != RASTERIZER_SEMANTIC_DIM:
+            raise ValueError(
+                f"This build expects semantic_dim={RASTERIZER_SEMANTIC_DIM}, got semantic_dim={semantic_dim}. "
+                "Rebuild the rasterizer if you change the embedding dimension."
+            )
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
+        self.semantic_dim = semantic_dim
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
         self._semantic = torch.empty(0)
+        self._semantic_prototypes = torch.empty(0)
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -73,6 +82,7 @@ class GaussianModel:
             self._features_dc,
             self._features_rest,
             self._semantic,
+            self._semantic_prototypes,
             self._scaling,
             self._rotation,
             self._opacity,
@@ -84,12 +94,13 @@ class GaussianModel:
         )
     
     def restore(self, model_args, training_args):
-        if len(model_args) == 13:
+        if len(model_args) == 14:
             (self.active_sh_degree, 
             self._xyz, 
             self._features_dc, 
             self._features_rest,
             self._semantic,
+            self._semantic_prototypes,
             self._scaling, 
             self._rotation, 
             self._opacity,
@@ -98,7 +109,7 @@ class GaussianModel:
             denom,
             opt_dict, 
             self.spatial_lr_scale) = model_args
-        else:
+        elif len(model_args) == 13:
             (self.active_sh_degree, 
             self._xyz, 
             self._features_dc, 
@@ -111,7 +122,10 @@ class GaussianModel:
             denom,
             opt_dict, 
             self.spatial_lr_scale) = model_args
-            self._semantic = nn.Parameter(torch.zeros((self._xyz.shape[0], 1), device="cuda").requires_grad_(True))
+            self._semantic = nn.Parameter(torch.zeros((self._xyz.shape[0], self.semantic_dim), device="cuda").requires_grad_(True))
+            self._semantic_prototypes = nn.Parameter(torch.eye(2, self.semantic_dim, device="cuda").requires_grad_(True))
+        else:
+            raise ValueError(f"Unexpected checkpoint format with {len(model_args)} items.")
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -153,6 +167,10 @@ class GaussianModel:
     @property
     def get_semantic(self):
         return self._semantic
+
+    @property
+    def get_semantic_prototypes(self):
+        return self._semantic_prototypes
     
     @property
     def get_exposure(self):
@@ -191,7 +209,8 @@ class GaussianModel:
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
-        self._semantic = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], 1), device="cuda").requires_grad_(True))
+        self._semantic = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], self.semantic_dim), device="cuda").requires_grad_(True))
+        self._semantic_prototypes = nn.Parameter(torch.eye(2, self.semantic_dim, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
@@ -226,6 +245,7 @@ class GaussianModel:
                 self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
+        self.prototype_optimizer = torch.optim.Adam([self._semantic_prototypes], lr=training_args.feature_lr)
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -325,11 +345,16 @@ class GaussianModel:
         semantic_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("semantic_")]
         semantic_names = sorted(semantic_names, key = lambda x: int(x.split('_')[-1]))
         if semantic_names:
-            semantics = np.zeros((xyz.shape[0], len(semantic_names)))
+            semantics = np.zeros((xyz.shape[0], len(semantic_names)), dtype=np.float32)
             for idx, attr_name in enumerate(semantic_names):
                 semantics[:, idx] = np.asarray(plydata.elements[0][attr_name])
         else:
-            semantics = np.zeros((xyz.shape[0], 1), dtype=np.float32)
+            semantics = np.zeros((xyz.shape[0], 0), dtype=np.float32)
+
+        if semantics.shape[1] < self.semantic_dim:
+            semantics = np.pad(semantics, ((0, 0), (0, self.semantic_dim - semantics.shape[1])), mode="constant")
+        elif semantics.shape[1] > self.semantic_dim:
+            semantics = semantics[:, :self.semantic_dim]
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
         scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
@@ -347,6 +372,7 @@ class GaussianModel:
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._semantic = nn.Parameter(torch.tensor(semantics, dtype=torch.float, device="cuda").contiguous().requires_grad_(True))
+        self._semantic_prototypes = nn.Parameter(torch.eye(2, self.semantic_dim, device="cuda").requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))

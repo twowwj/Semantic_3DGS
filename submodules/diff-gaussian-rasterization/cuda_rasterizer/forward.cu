@@ -260,7 +260,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		features[idx * C + 1] = colors_precomp[idx * 3 + 1];
 		features[idx * C + 2] = colors_precomp[idx * 3 + 2];
 	}
-	features[idx * C + 3] = semantics[idx];
+	for (int semantic_channel = 0; semantic_channel < NUM_SEMANTIC_CHANNELS; ++semantic_channel)
+	{
+		features[idx * C + 3 + semantic_channel] = semantics[idx * NUM_SEMANTIC_CHANNELS + semantic_channel];
+	}
 
 	// Store some useful helper data for the next steps.
 	depths[idx] = p_view.z;

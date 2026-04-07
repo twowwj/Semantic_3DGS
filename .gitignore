@@ -7,4 +7,9 @@ diff_rasterization/dist
 tensorboard_3d
 screenshots
 \output
-data
+\data
+.DS_Store
+
+
+
+

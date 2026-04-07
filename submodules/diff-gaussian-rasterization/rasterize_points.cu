@@ -64,6 +64,10 @@ RasterizeGaussiansCUDA(
   const int H = image_height;
   const int W = image_width;
 
+  if (semantics.numel() != 0 && (semantics.ndimension() != 2 || semantics.size(1) != NUM_SEMANTIC_CHANNELS)) {
+    AT_ERROR("semantics must have dimensions (num_points, NUM_SEMANTIC_CHANNELS)");
+  }
+
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
@@ -166,7 +170,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dcolors = torch::zeros({P, 3}, means3D.options());
-  torch::Tensor dL_dsemantics = torch::zeros({P, 1}, means3D.options());
+  torch::Tensor dL_dsemantics = torch::zeros({P, NUM_SEMANTIC_CHANNELS}, means3D.options());
   torch::Tensor dL_dconic = torch::zeros({P, 2, 2}, means3D.options());
   torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());
   torch::Tensor dL_dcov3D = torch::zeros({P, 6}, means3D.options());

@@ -11,6 +11,7 @@
 
 import os
 import torch
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -40,6 +41,24 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+def prototype_semantic_loss(semantic_image, semantic_map, prototypes, temperature, valid_mask=None):
+    features = semantic_image.permute(1, 2, 0).reshape(-1, semantic_image.shape[0])
+    labels = (semantic_map.reshape(-1) >= 0.5).long()
+
+    if valid_mask is not None:
+        valid = valid_mask.reshape(-1) > 0
+        features = features[valid]
+        labels = labels[valid]
+
+    if features.numel() == 0:
+        return semantic_image.new_tensor(0.0)
+
+    normalized_features = F.normalize(features, dim=-1, eps=1e-6)
+    normalized_prototypes = F.normalize(prototypes, dim=-1, eps=1e-6)
+    logits = normalized_features @ normalized_prototypes.t()
+    logits = logits / max(temperature, 1e-6)
+    return F.cross_entropy(logits, labels)
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -47,7 +66,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+    gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type, dataset.semantic_dim)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -115,8 +134,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image *= alpha_mask
-            semantic_image *= alpha_mask
             image = image * alpha_mask
             semantic_image = semantic_image * alpha_mask
 
@@ -130,13 +147,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        # Semantic regularization from offline segmentation masks
+        valid_semantic_mask = None
+        if viewpoint_cam.alpha_mask is not None:
+            valid_semantic_mask = alpha_mask
+
+        # Prototype-guided semantic regularization from offline segmentation masks
         Lsemantic = 0.0
         if opt.use_semantic_loss and opt.lambda_semantic > 0 and viewpoint_cam.semantic_map is not None:
             gt_semantic = viewpoint_cam.semantic_map.cuda()
             if viewpoint_cam.alpha_mask is not None:
                 gt_semantic = gt_semantic * alpha_mask
-            Lsemantic = l1_loss(semantic_image, gt_semantic)
+            Lsemantic = prototype_semantic_loss(
+                semantic_image,
+                gt_semantic,
+                gaussians.get_semantic_prototypes,
+                opt.semantic_temperature,
+                valid_semantic_mask,
+            )
             loss += opt.lambda_semantic * Lsemantic
 
         # Depth regularization
@@ -197,6 +224,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                gaussians.prototype_optimizer.step()
+                gaussians.prototype_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])

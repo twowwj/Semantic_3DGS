@@ -595,7 +595,7 @@ renderCUDA(
 				}
 				else
 				{
-					atomicAdd(&(dL_dsemantic[global_id]), dchannel_dcolor * dL_dchannel);
+					atomicAdd(&(dL_dsemantic[global_id * NUM_SEMANTIC_CHANNELS + (ch - 3)]), dchannel_dcolor * dL_dchannel);
 				}
 			}
 			// Propagate gradients from inverse depth to alphaas and

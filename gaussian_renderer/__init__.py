@@ -105,16 +105,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         rgb_image = rendered_image[:3]
         rendered_image = torch.cat((
             torch.matmul(rgb_image.permute(1, 2, 0), exposure[:3, :3]).permute(2, 0, 1) + exposure[:3, 3, None, None],
-            rendered_image[3:4]
+            rendered_image[3:]
         ), dim=0)
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    semantic_image = rendered_image[3:4]
+    semantic_image = rendered_image[3:]
     rendered_image = rendered_image[:3].clamp(0, 1)
     out = {
-        "render": rendered_image,
-        "semantic": semantic_image,
         "render": rendered_image.clone(),
         "semantic": semantic_image.clone(),
         "viewspace_points": screenspace_points,

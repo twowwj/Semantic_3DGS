@@ -52,6 +52,7 @@ class ModelParams(ParamGroup):
         self._images = "images"
         self._depths = ""
         self.semantic_dir = ""
+        self.semantic_dim = 8
         self._resolution = -1
         self._white_background = False
         self.train_test_exp = False
@@ -97,7 +98,8 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01
         self.use_semantic_loss = False
-        self.lambda_semantic = 0.0
+        self.lambda_semantic = 0.1
+        self.semantic_temperature = 0.1
         self.random_background = False
         self.optimizer_type = "default"
         super().__init__(parser, "Optimization Parameters")
