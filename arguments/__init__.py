@@ -58,6 +58,10 @@ class ModelParams(ParamGroup):
         self.train_test_exp = False
         self.data_device = "cuda"
         self.eval = False
+        self.use_wandb = False
+        self.wandb_project = "gaussian-splatting"
+        self.wandb_entity = ""
+        self.wandb_run_name = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -100,6 +104,15 @@ class OptimizationParams(ParamGroup):
         self.use_semantic_loss = False
         self.lambda_semantic = 0.1
         self.semantic_temperature = 0.1
+        self.use_semantic_structure_guidance = False
+        self.semantic_guidance_from_iter = 7000
+        self.semantic_guidance_until_iter = 15000
+        self.semantic_densify_weight = 1.0
+        self.semantic_uncertainty_threshold = 0.35
+        self.semantic_densify_max_ratio = 0.01
+        self.semantic_prune_opacity_multiplier = 2.0
+        self.semantic_prune_confidence_threshold = 0.55
+        self.semantic_bg_prune_threshold = 0.55
         self.random_background = False
         self.optimizer_type = "default"
         super().__init__(parser, "Optimization Parameters")

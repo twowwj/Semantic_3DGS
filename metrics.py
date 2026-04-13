@@ -20,11 +20,14 @@ import json
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser
+from arguments import ModelParams
 
 torch.backends.cudnn.enabled = False
-device = torch.device("cuda:0")
-torch.cuda.set_device(device)
-
+try:
+    import wandb
+    WANDB_FOUND = True
+except ImportError:
+    WANDB_FOUND = False
 
 def readImages(renders_dir, gt_dir):
     renders = []
@@ -38,7 +41,26 @@ def readImages(renders_dir, gt_dir):
         image_names.append(fname)
     return renders, gts, image_names
 
-def evaluate(model_paths):
+def init_wandb(args, model_path):
+    if not args.use_wandb:
+        return None
+    if not WANDB_FOUND:
+        print("wandb requested but not installed: not logging to wandb")
+        return None
+    run_name = args.wandb_run_name if args.wandb_run_name else f"metrics-{Path(model_path).name}"
+    wandb_kwargs = {
+        "project": args.wandb_project,
+        "name": run_name,
+        "entity": args.wandb_entity if args.wandb_entity else None,
+        "config": vars(args),
+        "dir": model_path,
+        "job_type": "metrics",
+        "reinit": True,
+    }
+    return wandb.init(**{k: v for k, v in wandb_kwargs.items() if v is not None})
+
+
+def evaluate(model_paths, args):
 
     full_dict = {}
     per_view_dict = {}
@@ -47,6 +69,7 @@ def evaluate(model_paths):
     print("")
 
     for scene_dir in model_paths:
+        wandb_run = init_wandb(args, scene_dir)
         try:
             print("Scene:", scene_dir)
             full_dict[scene_dir] = {}
@@ -89,16 +112,24 @@ def evaluate(model_paths):
                 per_view_dict[scene_dir][method].update({"SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
                                                             "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
                                                             "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)}})
+                if wandb_run:
+                    wandb_run.log({
+                        f"metrics/{method}/SSIM": full_dict[scene_dir][method]["SSIM"],
+                        f"metrics/{method}/PSNR": full_dict[scene_dir][method]["PSNR"],
+                        f"metrics/{method}/LPIPS": full_dict[scene_dir][method]["LPIPS"],
+                    })
 
             with open(scene_dir + "/results.json", 'w') as fp:
                 json.dump(full_dict[scene_dir], fp, indent=True)
             with open(scene_dir + "/per_view.json", 'w') as fp:
                 json.dump(per_view_dict[scene_dir], fp, indent=True)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
             print("Unable to compute metrics for model", scene_dir)
-
+            print("Reason:", repr(e))
+            raise
+        finally:
+            if wandb_run:
+                wandb_run.finish()
 
 if __name__ == "__main__":
     device = torch.device("cuda:0")
@@ -106,6 +137,7 @@ if __name__ == "__main__":
 
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
+    model = ModelParams(parser, sentinel=True)
+    parser.add_argument('--model_paths', required=True, nargs="+", type=str, default=[])
     args = parser.parse_args()
-    evaluate(args.model_paths)
+    evaluate(args.model_paths, args)

@@ -30,6 +30,12 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 try:
+    import wandb
+    WANDB_FOUND = True
+except ImportError:
+    WANDB_FOUND = False
+
+try:
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
 except:
@@ -59,13 +65,37 @@ def prototype_semantic_loss(semantic_image, semantic_map, prototypes, temperatur
     logits = logits / max(temperature, 1e-6)
     return F.cross_entropy(logits, labels)
 
+def gaussian_semantic_guidance_stats(semantic_embeddings, prototypes, temperature):
+    normalized_embeddings = F.normalize(semantic_embeddings, dim=-1, eps=1e-6)
+    normalized_prototypes = F.normalize(prototypes, dim=-1, eps=1e-6)
+    logits = normalized_embeddings @ normalized_prototypes.t()
+    logits = logits / max(temperature, 1e-6)
+    probabilities = torch.softmax(logits, dim=-1)
+    confidence = probabilities.max(dim=-1, keepdim=True).values
+    uncertainty = 1.0 - confidence
+    background_probability = probabilities[:, :1]
+    return uncertainty.detach(), confidence.detach(), background_probability.detach()
+
+def log_metrics(tb_writer, wandb_run, metrics, step):
+    if tb_writer:
+        for key, value in metrics.items():
+            tb_writer.add_scalar(key, value, step)
+    if wandb_run:
+        wandb_run.log(metrics, step=step)
+
+def maybe_log_wandb_image(wandb_run, key, image_tensor, step):
+    if not wandb_run:
+        return
+    image = torch.clamp(image_tensor.detach(), 0.0, 1.0).permute(1, 2, 0).cpu().numpy()
+    wandb_run.log({key: wandb.Image(image)}, step=step)
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
+    tb_writer, wandb_run = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type, dataset.semantic_dim)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -194,6 +224,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
             ema_Lsemantic_for_log = 0.4 * Lsemantic_log + 0.6 * ema_Lsemantic_for_log
+            semantic_guidance_active = (
+                opt.use_semantic_structure_guidance and
+                iteration >= opt.semantic_guidance_from_iter and
+                iteration <= opt.semantic_guidance_until_iter
+            )
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}", "Semantic Loss": f"{ema_Lsemantic_for_log:.{7}f}"})
@@ -202,7 +237,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            log_metrics(tb_writer, wandb_run, {
+                "train/l1_loss": Ll1.item(),
+                "train/total_loss": loss.item(),
+                "train/iter_time_ms": iter_start.elapsed_time(iter_end),
+                "train/depth_loss": Ll1depth,
+                "train/semantic_loss": Lsemantic_log,
+                "train/total_points": gaussians.get_xyz.shape[0],
+            }, iteration)
+            training_report(tb_writer, wandb_run, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -212,10 +255,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                if semantic_guidance_active:
+                    uncertainty, confidence, background_probability = gaussian_semantic_guidance_stats(
+                        gaussians.get_semantic,
+                        gaussians.get_semantic_prototypes,
+                        opt.semantic_temperature,
+                    )
+                    gaussians.add_semantic_guidance_stats(uncertainty, confidence, background_probability, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold,
+                        0.005,
+                        scene.cameras_extent,
+                        size_threshold,
+                        radii,
+                        use_semantic_structure_guidance=semantic_guidance_active,
+                        semantic_densify_weight=opt.semantic_densify_weight,
+                        semantic_uncertainty_threshold=opt.semantic_uncertainty_threshold,
+                        semantic_densify_max_ratio=opt.semantic_densify_max_ratio,
+                        semantic_prune_opacity_multiplier=opt.semantic_prune_opacity_multiplier,
+                        semantic_prune_confidence_threshold=opt.semantic_prune_confidence_threshold,
+                        semantic_bg_prune_threshold=opt.semantic_bg_prune_threshold,
+                    )
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -238,6 +301,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+    if wandb_run:
+        wandb_run.finish()
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -253,18 +319,30 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
     # Create Tensorboard writer
-    tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
+    wandb_run = None
+    if args.use_wandb:
+        if not WANDB_FOUND:
+            print("wandb requested but not installed: not logging to wandb")
+        else:
+            wandb_kwargs = {
+                "project": args.wandb_project,
+                "name": args.wandb_run_name if args.wandb_run_name else None,
+                "config": vars(args),
+                "dir": args.model_path,
+            }
+            if args.wandb_entity:
+                wandb_kwargs["entity"] = args.wandb_entity
+            wandb_run = wandb.init(**wandb_kwargs)
+        tb_writer = None
     else:
-        print("Tensorboard not available: not logging progress")
-    return tb_writer
+        tb_writer = None
+        if TENSORBOARD_FOUND:
+            tb_writer = SummaryWriter(args.model_path)
+        else:
+            print("Tensorboard not available: not logging progress")
+    return tb_writer, wandb_run
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
-    if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
+def training_report(tb_writer, wandb_run, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
 
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -286,18 +364,24 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                    if wandb_run and (idx < 3):
+                        maybe_log_wandb_image(wandb_run, f"{config['name']}/{viewpoint.image_name}/render", image, iteration)
+                        if iteration == testing_iterations[0]:
+                            maybe_log_wandb_image(wandb_run, f"{config['name']}/{viewpoint.image_name}/ground_truth", gt_image, iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                log_metrics(tb_writer, wandb_run, {
+                    f"{config['name']}/l1_loss": l1_test,
+                    f"{config['name']}/psnr": psnr_test,
+                }, iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        if wandb_run:
+            wandb_run.log({"scene/total_points_eval": scene.gaussians.get_xyz.shape[0]}, step=iteration)
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":

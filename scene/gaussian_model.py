@@ -31,6 +31,18 @@ RASTERIZER_SEMANTIC_DIM = 8
 
 class GaussianModel:
 
+    def _cap_mask_by_scores(self, mask, scores, max_selected):
+        selected_count = int(mask.sum().item())
+        if max_selected <= 0 or selected_count <= max_selected:
+            return mask
+
+        selected_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+        selected_scores = scores[selected_indices]
+        topk_indices = torch.topk(selected_scores, k=max_selected, sorted=False).indices
+        limited_mask = torch.zeros_like(mask)
+        limited_mask[selected_indices[topk_indices]] = True
+        return limited_mask
+
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
@@ -70,6 +82,10 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        self.semantic_uncertainty_accum = torch.empty(0)
+        self.semantic_confidence_accum = torch.empty(0)
+        self.semantic_bg_accum = torch.empty(0)
+        self.semantic_denom = torch.empty(0)
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -89,12 +105,39 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
+            self.semantic_uncertainty_accum,
+            self.semantic_confidence_accum,
+            self.semantic_bg_accum,
+            self.semantic_denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
     
     def restore(self, model_args, training_args):
-        if len(model_args) == 14:
+        if len(model_args) == 18:
+            (self.active_sh_degree, 
+            self._xyz, 
+            self._features_dc, 
+            self._features_rest,
+            self._semantic,
+            self._semantic_prototypes,
+            self._scaling, 
+            self._rotation, 
+            self._opacity,
+            self.max_radii2D, 
+            xyz_gradient_accum, 
+            denom,
+            semantic_uncertainty_accum,
+            semantic_confidence_accum,
+            semantic_bg_accum,
+            semantic_denom,
+            opt_dict, 
+            self.spatial_lr_scale) = model_args
+            self.semantic_uncertainty_accum = semantic_uncertainty_accum
+            self.semantic_confidence_accum = semantic_confidence_accum
+            self.semantic_bg_accum = semantic_bg_accum
+            self.semantic_denom = semantic_denom
+        elif len(model_args) == 14:
             (self.active_sh_degree, 
             self._xyz, 
             self._features_dc, 
@@ -109,6 +152,10 @@ class GaussianModel:
             denom,
             opt_dict, 
             self.spatial_lr_scale) = model_args
+            self.semantic_uncertainty_accum = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+            self.semantic_confidence_accum = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+            self.semantic_bg_accum = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+            self.semantic_denom = torch.zeros((self._xyz.shape[0], 1), device="cuda")
         elif len(model_args) == 13:
             (self.active_sh_degree, 
             self._xyz, 
@@ -124,11 +171,20 @@ class GaussianModel:
             self.spatial_lr_scale) = model_args
             self._semantic = nn.Parameter(torch.zeros((self._xyz.shape[0], self.semantic_dim), device="cuda").requires_grad_(True))
             self._semantic_prototypes = nn.Parameter(torch.eye(2, self.semantic_dim, device="cuda").requires_grad_(True))
+            self.semantic_uncertainty_accum = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+            self.semantic_confidence_accum = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+            self.semantic_bg_accum = torch.zeros((self._xyz.shape[0], 1), device="cuda")
+            self.semantic_denom = torch.zeros((self._xyz.shape[0], 1), device="cuda")
         else:
             raise ValueError(f"Unexpected checkpoint format with {len(model_args)} items.")
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
+        if len(model_args) == 18:
+            self.semantic_uncertainty_accum = semantic_uncertainty_accum
+            self.semantic_confidence_accum = semantic_confidence_accum
+            self.semantic_bg_accum = semantic_bg_accum
+            self.semantic_denom = semantic_denom
         try:
             self.optimizer.load_state_dict(opt_dict)
         except ValueError:
@@ -171,6 +227,15 @@ class GaussianModel:
     @property
     def get_semantic_prototypes(self):
         return self._semantic_prototypes
+
+    @property
+    def get_semantic_stats(self):
+        semantic_denom = torch.clamp_min(self.semantic_denom, 1.0)
+        return {
+            "uncertainty": self.semantic_uncertainty_accum / semantic_denom,
+            "confidence": self.semantic_confidence_accum / semantic_denom,
+            "background": self.semantic_bg_accum / semantic_denom,
+        }
     
     @property
     def get_exposure(self):
@@ -224,6 +289,10 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.semantic_uncertainty_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.semantic_confidence_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.semantic_bg_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.semantic_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -427,6 +496,10 @@ class GaussianModel:
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
+        self.semantic_uncertainty_accum = self.semantic_uncertainty_accum[valid_points_mask]
+        self.semantic_confidence_accum = self.semantic_confidence_accum[valid_points_mask]
+        self.semantic_bg_accum = self.semantic_bg_accum[valid_points_mask]
+        self.semantic_denom = self.semantic_denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
 
@@ -473,14 +546,26 @@ class GaussianModel:
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.semantic_uncertainty_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.semantic_confidence_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.semantic_bg_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.semantic_denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, semantic_stats=None, uncertainty_threshold=0.35, semantic_densify_max_ratio=0.05, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        if semantic_stats is not None:
+            padded_uncertainty = torch.zeros((n_init_points), device="cuda")
+            uncertainty = semantic_stats["uncertainty"].squeeze(-1)
+            padded_uncertainty[:uncertainty.shape[0]] = uncertainty
+            semantic_selected_mask = padded_uncertainty >= uncertainty_threshold
+            max_semantic_selected = max(1, int(n_init_points * semantic_densify_max_ratio))
+            semantic_selected_mask = self._cap_mask_by_scores(semantic_selected_mask, padded_uncertainty, max_semantic_selected)
+            selected_pts_mask = torch.logical_or(selected_pts_mask, semantic_selected_mask)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
@@ -502,9 +587,15 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, semantic_stats=None, semantic_densify_weight=1.0, semantic_densify_max_ratio=0.05):
         # Extract points that satisfy the gradient condition
-        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        effective_grads = torch.norm(grads, dim=-1)
+        if semantic_stats is not None:
+            effective_grads = effective_grads + semantic_densify_weight * semantic_stats["uncertainty"].squeeze(-1)
+        selected_pts_mask = torch.where(effective_grads >= grad_threshold, True, False)
+        if semantic_stats is not None:
+            max_semantic_selected = max(1, int(self.get_xyz.shape[0] * semantic_densify_max_ratio))
+            selected_pts_mask = self._cap_mask_by_scores(selected_pts_mask, effective_grads, max_semantic_selected)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
@@ -520,15 +611,39 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_semantic, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii,
+                          use_semantic_structure_guidance=False,
+                          semantic_densify_weight=1.0,
+                          semantic_uncertainty_threshold=0.35,
+                          semantic_densify_max_ratio=0.05,
+                          semantic_prune_opacity_multiplier=2.0,
+                          semantic_prune_confidence_threshold=0.55,
+                          semantic_bg_prune_threshold=0.55):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
+        semantic_stats = None
+        if use_semantic_structure_guidance:
+            semantic_stats = self.get_semantic_stats
+
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_clone(grads, max_grad, extent, semantic_stats, semantic_densify_weight, semantic_densify_max_ratio)
+        self.densify_and_split(grads, max_grad, extent, semantic_stats, semantic_uncertainty_threshold, semantic_densify_max_ratio)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if semantic_stats is not None:
+            n_points = self.get_xyz.shape[0]
+            padded_confidence = torch.ones((n_points), device="cuda")
+            padded_background = torch.zeros((n_points), device="cuda")
+            confidence = semantic_stats["confidence"].squeeze(-1)
+            background = semantic_stats["background"].squeeze(-1)
+            padded_confidence[:confidence.shape[0]] = confidence
+            padded_background[:background.shape[0]] = background
+            low_opacity_background = self.get_opacity.squeeze() < (min_opacity * semantic_prune_opacity_multiplier)
+            low_confidence = padded_confidence < semantic_prune_confidence_threshold
+            background_like = padded_background > semantic_bg_prune_threshold
+            semantic_prune_mask = torch.logical_and(torch.logical_and(low_opacity_background, low_confidence), background_like)
+            prune_mask = torch.logical_or(prune_mask, semantic_prune_mask)
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
@@ -542,3 +657,9 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def add_semantic_guidance_stats(self, uncertainty, confidence, background_probability, update_filter):
+        self.semantic_uncertainty_accum[update_filter] += uncertainty[update_filter]
+        self.semantic_confidence_accum[update_filter] += confidence[update_filter]
+        self.semantic_bg_accum[update_filter] += background_probability[update_filter]
+        self.semantic_denom[update_filter] += 1
