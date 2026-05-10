@@ -254,7 +254,7 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
+    def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float, semantic_init=None):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
@@ -274,7 +274,16 @@ class GaussianModel:
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
-        self._semantic = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], self.semantic_dim), device="cuda").requires_grad_(True))
+        if semantic_init is None:
+            semantic_init = torch.zeros((fused_point_cloud.shape[0], self.semantic_dim), device="cuda")
+        else:
+            semantic_init = semantic_init.to(device="cuda", dtype=torch.float32)
+            if semantic_init.shape != (fused_point_cloud.shape[0], self.semantic_dim):
+                raise ValueError(
+                    f"semantic_init must have shape {(fused_point_cloud.shape[0], self.semantic_dim)}, "
+                    f"got {tuple(semantic_init.shape)}"
+                )
+        self._semantic = nn.Parameter(semantic_init.contiguous().requires_grad_(True))
         self._semantic_prototypes = nn.Parameter(torch.eye(2, self.semantic_dim, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))

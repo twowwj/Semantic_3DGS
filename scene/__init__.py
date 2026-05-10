@@ -15,8 +15,10 @@ import json
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
+from scene.dino_init import build_dino_semantic_init, resolve_dino_feature_dir
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+import torch
 
 class Scene:
 
@@ -80,7 +82,25 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"), args.train_test_exp)
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
+            semantic_init = None
+            if args.use_dino_semantic_init:
+                dino_feature_dir = resolve_dino_feature_dir(args.source_path, args.dino_feature_dir)
+                if dino_feature_dir == "":
+                    print("[DINO init] --use_dino_semantic_init was set but --dino_feature_dir is empty; using zero semantic initialization.")
+                elif not os.path.isdir(dino_feature_dir):
+                    print(f"[DINO init] Feature directory not found: {dino_feature_dir}; using zero semantic initialization.")
+                else:
+                    points_xyz = torch.tensor(scene_info.point_cloud.points, dtype=torch.float32, device="cuda")
+                    semantic_init = build_dino_semantic_init(
+                        points_xyz=points_xyz,
+                        cameras=self.train_cameras[1.0],
+                        feature_dir=dino_feature_dir,
+                        semantic_dim=args.semantic_dim,
+                        max_views=args.dino_init_max_views,
+                        chunk_size=args.dino_init_chunk_size,
+                        reduction_samples=args.dino_init_reduction_samples,
+                    )
+            self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent, semantic_init=semantic_init)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))

@@ -13,6 +13,8 @@ import os
 import torch
 import torch.nn.functional as F
 from random import randint
+import cv2
+import numpy as np
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
@@ -47,14 +49,47 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def prototype_semantic_loss(semantic_image, semantic_map, prototypes, temperature, valid_mask=None):
+def build_boundary_weight_map(semantic_map, boundary_loss_weight, kernel_size, valid_mask=None):
+    mask_np = (semantic_map.squeeze(0).detach().cpu().numpy() >= 0.5).astype(np.uint8)
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    dilated = cv2.dilate(mask_np, kernel, iterations=1)
+    eroded = cv2.erode(mask_np, kernel, iterations=1)
+    boundary = ((dilated - eroded) > 0).astype(np.float32)
+
+    weights = 1.0 + boundary * boundary_loss_weight
+    weights = torch.from_numpy(weights).to(device=semantic_map.device, dtype=torch.float32)
+    if valid_mask is not None:
+        weights = weights * (valid_mask.squeeze(0) > 0).float()
+    return weights.reshape(-1)
+
+def prototype_semantic_loss(
+    semantic_image,
+    semantic_map,
+    prototypes,
+    temperature,
+    valid_mask=None,
+    use_boundary_weighting=False,
+    boundary_loss_weight=2.0,
+    boundary_kernel_size=9,
+):
     features = semantic_image.permute(1, 2, 0).reshape(-1, semantic_image.shape[0])
     labels = (semantic_map.reshape(-1) >= 0.5).long()
+    weights = None
+
+    if use_boundary_weighting:
+        weights = build_boundary_weight_map(
+            semantic_map,
+            boundary_loss_weight=boundary_loss_weight,
+            kernel_size=boundary_kernel_size,
+            valid_mask=valid_mask,
+        )
 
     if valid_mask is not None:
         valid = valid_mask.reshape(-1) > 0
         features = features[valid]
         labels = labels[valid]
+        if weights is not None:
+            weights = weights[valid]
 
     if features.numel() == 0:
         return semantic_image.new_tensor(0.0)
@@ -63,7 +98,12 @@ def prototype_semantic_loss(semantic_image, semantic_map, prototypes, temperatur
     normalized_prototypes = F.normalize(prototypes, dim=-1, eps=1e-6)
     logits = normalized_features @ normalized_prototypes.t()
     logits = logits / max(temperature, 1e-6)
-    return F.cross_entropy(logits, labels)
+    if weights is None:
+        return F.cross_entropy(logits, labels)
+
+    per_pixel_loss = F.cross_entropy(logits, labels, reduction="none")
+    weighted_sum = (per_pixel_loss * weights).sum()
+    return weighted_sum / weights.sum().clamp_min(1e-6)
 
 def gaussian_semantic_guidance_stats(semantic_embeddings, prototypes, temperature):
     normalized_embeddings = F.normalize(semantic_embeddings, dim=-1, eps=1e-6)
@@ -193,6 +233,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.get_semantic_prototypes,
                 opt.semantic_temperature,
                 valid_semantic_mask,
+                use_boundary_weighting=opt.use_boundary_weighted_semantic_loss,
+                boundary_loss_weight=opt.boundary_loss_weight,
+                boundary_kernel_size=opt.boundary_kernel_size,
             )
             loss += opt.lambda_semantic * Lsemantic
 
